@@ -98,95 +98,145 @@ app.all("/toyyib/return", (req, res) => {
 </html>`);
 });
 
-// CALLBACK (server→server) + token + validation + UPSERT
-app.post("/toyyib/callback/:token", async (req, res) => {
+// ===== REPLACE the whole /toyyib/return handler with this =====
+app.all("/toyyib/return", async (req, res) => {
   try {
-    // 1) Token check
-    if (!CALLBACK_TOKEN || req.params.token !== CALLBACK_TOKEN) {
-      return res.status(403).type("text").send("Forbidden");
+    const params    = Object.keys(req.query).length ? req.query : req.body;
+    const status_id = (params.status_id || "").toString();
+    const billcode  = (params.billcode  || "").toString();
+    const order_id  = (params.order_id  || "").toString();
+    const txid      = (params.transaction_id || "").toString();
+
+    // status text + class
+    const statusText = status_id === "1" ? "BERJAYA"
+                     : status_id === "3" ? "GAGAL"
+                     : "PENDING / TIDAK PASTI";
+    const className  = status_id === "1" ? "ok"
+                     : status_id === "3" ? "fail"
+                     : "pending";
+
+    // --- dapatkan amount (guna param jika ada; kalau tiada, cari di DB ikut order_id)
+    const toCents = v => {
+      if (v == null || v === "") return null;
+      const s = String(v).trim();
+      if (/^\d+$/.test(s)) return parseInt(s,10);     // sudah dalam sen
+      const f = Number.parseFloat(s);
+      return Number.isNaN(f) ? null : Math.round(f*100); // RM -> sen
+    };
+    let amountCents = toCents(params.amount);
+
+    if ((amountCents == null || Number.isNaN(amountCents)) && order_id) {
+      try {
+        const q = await pool.query(
+          "select amount_cents from orders where order_id = $1 order by id desc limit 1",
+          [order_id]
+        );
+        if (q.rowCount > 0) amountCents = q.rows[0].amount_cents;
+      } catch (e) {
+        console.warn("Return lookup DB failed:", e.message);
+      }
+    }
+    const amountStr = (amountCents != null && !Number.isNaN(amountCents))
+      ? `RM ${(amountCents/100).toFixed(2)}`
+      : "—";
+
+    // --- (OPTIONAL) upsert supaya ada rekod walaupun callback lambat/tersekat
+    try {
+      if (order_id && status_id) {
+        await pool.query(`
+          insert into orders (order_id, billcode, amount_cents, status_id, status_text, raw_payload, paid_at, updated_at)
+          values ($1,$2,$3,$4,$5,$6,$7, now())
+          on conflict (order_id) do update set
+            billcode = excluded.billcode,
+            amount_cents = excluded.amount_cents,
+            status_id = excluded.status_id,
+            status_text = excluded.status_text,
+            raw_payload = excluded.raw_payload,
+            paid_at = excluded.paid_at,
+            updated_at = now();
+        `, [
+          order_id,
+          billcode || null,
+          amountCents ?? 0,
+          parseInt(status_id || "0", 10),
+          (status_id==="1" ? "PAID" : status_id==="3" ? "FAILED" : "PENDING"),
+          JSON.stringify(params),
+          (status_id==="1" ? new Date() : null)
+        ]);
+      }
+    } catch (e) {
+      console.warn("Return upsert warn:", e.message);
     }
 
-    // 2) Payload
-    const p = Object.keys(req.body).length ? req.body : req.query;
+    // --- sediakan deep link ke app
+    const appLink =
+      `mizrahbeauty://payment-result` +
+      `?status_id=${encodeURIComponent(status_id)}` +
+      `&billcode=${encodeURIComponent(billcode||"")}` +
+      `&order_id=${encodeURIComponent(order_id||"")}` +
+      (amountCents!=null ? `&amount=${encodeURIComponent((amountCents/100).toFixed(2))}` : "") +
+      (txid ? `&transaction_id=${encodeURIComponent(txid)}` : "");
 
-    // 3) Require fields
-    const order_id = (p.order_id || "").toString().trim();
-    const billcode = (p.billcode || "").toString().trim();
-    const status_id = (p.status_id || "").toString().trim();
-    if (!order_id || !status_id) {
-      return res.status(400).type("text").send("Bad Request");
-    }
+    // fallback intent untuk Chrome Android
+    const androidIntent =
+      `intent://payment-result` +
+      `?status_id=${encodeURIComponent(status_id)}` +
+      `&billcode=${encodeURIComponent(billcode||"")}` +
+      `&order_id=${encodeURIComponent(order_id||"")}` +
+      (amountCents!=null ? `&amount=${encodeURIComponent((amountCents/100).toFixed(2))}` : "") +
+      (txid ? `&transaction_id=${encodeURIComponent(txid)}` : "") +
+      `#Intent;scheme=mizrahbeauty;package=com.tutorialworldskill.mizrahbeauty;end`;
 
-    // 4) Normalize
-    const status_text = mapStatus(status_id);
-    const amount_cents = toCents(p.amount);
-    const payer_email  = p.email || p.payer_email || null;
-    const payer_phone  = p.phone || p.payer_phone || null;
-    const payer_name   = p.name  || p.payer_name  || null;
-    const remarks      = p.msg   || p.remark      || null;
-    const paid_at      = status_id === "1" ? new Date() : null;
+    // --- render HTML + auto-redirect ke app
+    res.type("html").send(`<!doctype html>
+<html lang="ms"><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Resit / Return</title>
+<style>
+ body{font-family:system-ui,Arial,sans-serif;max-width:720px;margin:24px auto;padding:16px}
+ .card{border:1px solid #eee;border-radius:14px;padding:18px;box-shadow:0 2px 10px rgba(0,0,0,.05)}
+ .row{display:flex;gap:8px;align-items:center;margin:8px 0}
+ .key{width:160px;color:#666}
+ .val{font-weight:600}
+ .ok{color:#0a7}.fail{color:#c00}.pending{color:#555}
+ .btn{display:inline-block;margin-top:16px;padding:10px 14px;border-radius:10px;border:1px solid #ddd;text-decoration:none}
+ small{color:#888}
+</style>
 
-    // 5) Optional validation: amount mismatch flag
-    const existing = await pool.query(
-      "SELECT amount_cents FROM orders WHERE order_id = $1",
-      [order_id]
-    );
-    let final_status_text = status_text;
-    if (
-      existing.rowCount > 0 &&
-      amount_cents > 0 &&
-      existing.rows[0].amount_cents > 0 &&
-      existing.rows[0].amount_cents !== amount_cents
-    ) {
-      final_status_text = status_text + "_AMOUNT_MISMATCH";
-      console.warn("Amount mismatch for order:", order_id, {
-        expected: existing.rows[0].amount_cents, got: amount_cents
-      });
-    }
+<script>
+(function(){
+  var appLink = ${JSON.stringify(appLink)};
+  var androidIntent = ${JSON.stringify(androidIntent)};
+  var ua = navigator.userAgent || "";
 
-    // 6) UPSERT
-    await pool.query(
-      `
-      INSERT INTO orders (
-        order_id, billcode, amount_cents, status_id, status_text,
-        payer_email, payer_phone, payer_name, remarks, raw_payload, paid_at, updated_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-      ON CONFLICT (order_id) DO UPDATE SET
-        billcode     = EXCLUDED.billcode,
-        amount_cents = EXCLUDED.amount_cents,
-        status_id    = EXCLUDED.status_id,
-        status_text  = EXCLUDED.status_text,
-        payer_email  = EXCLUDED.payer_email,
-        payer_phone  = EXCLUDED.payer_phone,
-        payer_name   = EXCLUDED.payer_name,
-        remarks      = EXCLUDED.remarks,
-        raw_payload  = EXCLUDED.raw_payload,
-        paid_at      = EXCLUDED.paid_at,
-        updated_at   = NOW();
-      `,
-      [
-        order_id,
-        billcode || null,
-        amount_cents,
-        parseInt(status_id, 10) || 0,
-        final_status_text,
-        payer_email,
-        payer_phone,
-        payer_name,
-        remarks,
-        JSON.stringify(p),
-        paid_at
-      ]
-    );
+  // Cuba invoke app selepas ~600ms
+  setTimeout(function(){ window.location.href = appLink; }, 600);
 
-    console.log("[ToyyibPay callback OK]", { order_id, status_id, amount_cents });
-    return res.type("text").send("OK");
+  // Fallback intent untuk Chrome di Android
+  setTimeout(function(){
+    if (/Android/i.test(ua)) { window.location.href = androidIntent; }
+  }, 1200);
+})();
+</script>
+
+<h2>Maklumbalas Pembayaran</h2>
+<div class="card">
+  <div class="row"><div class="key">Status</div><div class="val ${className}">${statusText}</div></div>
+  <div class="row"><div class="key">Billcode</div><div class="val">${billcode || "—"}</div></div>
+  <div class="row"><div class="key">Order ID</div><div class="val">${order_id || "—"}</div></div>
+  <div class="row"><div class="key">Amount</div><div class="val">${amountStr}</div></div>
+  ${txid ? `<div class="row"><div class="key">Transaction ID</div><div class="val">${txid}</div></div>` : ""}
+</div>
+
+<a class="btn" href="${appLink}">Kembali ke aplikasi</a>
+<br><small>Jika aplikasi tidak terbuka secara automatik, tekan butang di atas.</small>
+</html>`);
   } catch (e) {
-    console.error("Callback error:", e);
-    return res.status(500).type("text").send("ERROR");
+    console.error("Return error:", e);
+    res.status(500).type("text").send("Internal error");
   }
 });
+
 
 // Start server
 app.listen(PORT, () => {
