@@ -10,6 +10,8 @@ const PORT = process.env.PORT || 3000;
 // - CALLBACK_TOKEN : contohnya "f1zToyyib123"
 const CALLBACK_TOKEN = process.env.CALLBACK_TOKEN || "";
 
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
 // Pool Postgres (Supabase)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
