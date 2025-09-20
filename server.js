@@ -99,16 +99,43 @@ app.get("/", (req, res) => {
   res.type("text").send("OK - ToyyibPay sandbox server is running");
 });
 
-// === RETURN (papar resit ringkas + auto-redirect deep link ke app) ===
+// === RETURN (papar resit + auto-redirect deep link ke app) ===
 app.all("/toyyib/return", async (req, res) => {
   const p = Object.keys(req.query).length ? req.query : req.body;
   const status_id = (p.status_id || "").toString();
   const billcode  = (p.billcode  || "").toString();
   const order_id  = (p.order_id  || "").toString();
   const txid      = (p.transaction_id || "").toString();
-  const amount    = p.amount && /^\d+(\.\d{1,2})?$/.test(p.amount) ? p.amount : "";
 
-  // Deep link ke app
+  // NEW: ambil amount dari DB ikut order_id (fallback guna query param)
+  let amount = "";
+  try {
+    if (order_id) {
+      const { rows } = await pool.query(
+        "SELECT amount_cents, billcode FROM orders WHERE order_id=$1 LIMIT 1",
+        [order_id]
+      );
+      if (rows.length) {
+        if (typeof rows[0].amount_cents === "number") {
+          amount = (rows[0].amount_cents / 100).toFixed(2);
+        }
+        // NEW: kalau return bawa billcode & DB belum ada → simpan sekali
+        if (billcode && !rows[0].billcode) {
+          await pool.query(
+            "UPDATE orders SET billcode=$1, updated_at=NOW() WHERE order_id=$2",
+            [billcode, order_id]
+          );
+        }
+      }
+    }
+  } catch (e) {
+    console.error("DB lookup/update on return failed:", e);
+  }
+  // fallback terakhir: cuba baca dari param (kadang-kadang ToyyibPay tak hantar)
+  if (!amount && p.amount && /^\d+(\.\d{1,2})?$/.test(p.amount)) {
+    amount = p.amount;
+  }
+
   const appLink =
     `mizrahbeauty://payment-result` +
     `?status_id=${encodeURIComponent(status_id)}` +
@@ -176,7 +203,7 @@ app.post("/toyyib/callback/:token", async (req, res) => {
     const txid = (p.transaction_id || "").toString();
     const amtCents = p.amount ? toCents(p.amount) : null;
 
-    // 3) sasarkan ikut order_id dahulu, fallback billcode
+    // 3) sediakan field untuk UPDATE
     const fields = {
       billcode: billcode || null,
       status_id: parseInt(sId || "0", 10) || 0,
@@ -191,7 +218,7 @@ app.post("/toyyib/callback/:token", async (req, res) => {
     const setCols = Object.keys(fields).map((k, i) => `${k} = $${i + 1}`).join(", ");
     const setVals = Object.values(fields);
 
-    // Update by order_id
+    // 4) Update by order_id → fallback billcode → kalau masih tiada, insert
     let result = { rowCount: 0 };
     if (order_id) {
       result = await pool.query(
@@ -199,20 +226,16 @@ app.post("/toyyib/callback/:token", async (req, res) => {
         [...setVals, order_id]
       );
     }
-
-    // Fallback: update by billcode
     if (result.rowCount === 0 && billcode) {
       result = await pool.query(
         `UPDATE orders SET ${setCols} WHERE billcode = $${setVals.length + 1}`,
         [...setVals, billcode]
       );
     }
-
-    // Jika masih tiada rekod → insert ringkas
     if (result.rowCount === 0) {
       await pool.query(
         `INSERT INTO orders (order_id, billcode, amount_cents, currency, status_id, status_text, raw_payload, paid_at)
-         VALUES ($1,$2,$3,'MYR',$4,$5,$6, $7)
+         VALUES ($1,$2,$3,'MYR',$4,$5,$6,$7)
          ON CONFLICT (order_id) DO NOTHING`,
         [
           order_id || `ORD-${Date.now()}`,
@@ -231,7 +254,6 @@ app.post("/toyyib/callback/:token", async (req, res) => {
       order_id, billcode, status_id: sId, transaction_id: txid
     });
 
-    // 4) balas 200 OK (ToyyibPay perlukan 200)
     res.type("text").send("OK");
   } catch (e) {
     console.error("callback error:", e);
