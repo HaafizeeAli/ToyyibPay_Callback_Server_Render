@@ -62,6 +62,30 @@ const toCents = v => {
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
+// === Register Order (dipanggil sebelum redirect ke ToyyibPay) ===
+app.post("/order/register", async (req, res) => {
+  try {
+    const { order_id, amount_cents, currency, payer_name, payer_phone, payer_email } = req.body;
+
+    if (!order_id || !amount_cents) {
+      return res.status(400).json({ ok: false, error: "missing order_id / amount_cents" });
+    }
+
+    await pool.query(
+      `INSERT INTO orders (order_id, amount_cents, currency, payer_name, payer_phone, payer_email, status_id, status_text, raw_payload)
+       VALUES ($1,$2,$3,$4,$5,$6,0,'REGISTERED','{}')
+       ON CONFLICT (order_id) DO NOTHING`,
+      [order_id, amount_cents, currency || "MYR", payer_name || "", payer_phone || "", payer_email || ""]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("register failed", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+
 // Healthcheck
 app.get("/", (req, res) => {
   res.type("text").send("OK - ToyyibPay sandbox server is running");
