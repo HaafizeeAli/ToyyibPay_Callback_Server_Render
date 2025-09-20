@@ -67,6 +67,38 @@ app.get("/", (req, res) => {
   res.type("text").send("OK - ToyyibPay sandbox server is running");
 });
 
+// Save the order (amount, payer info, etc.) *before* sending user to ToyyibPay
+app.post("/order/register", async (req, res) => {
+  try {
+    const { order_id, amount_cents, currency = "MYR", payer_email, payer_phone, payer_name } = req.body || {};
+    if (!order_id || !Number.isInteger(amount_cents)) {
+      return res.status(400).json({ ok: false, error: "order_id / amount_cents invalid" });
+    }
+
+    await pool.query(`
+      insert into orders (order_id, amount_cents, currency, status_id, status_text, payer_email, payer_phone, payer_name, raw_payload)
+      values ($1,$2,$3,0,'PENDING',$4,$5,$6,$7)
+      on conflict (order_id) do update set
+        amount_cents = excluded.amount_cents,
+        currency = excluded.currency,
+        payer_email = excluded.payer_email,
+        payer_phone = excluded.payer_phone,
+        payer_name = excluded.payer_name,
+        updated_at = now()
+    `, [
+      order_id, amount_cents, currency,
+      payer_email || null, payer_phone || null, payer_name || null,
+      JSON.stringify({ source: "app-pre-register" })
+    ]);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("pre-register error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+
 // RETURN (papar resit ringkas)
 app.all("/toyyib/return", (req, res) => {
   const params = Object.keys(req.query).length ? req.query : req.body;
