@@ -99,7 +99,7 @@ app.get("/", (req, res) => {
   res.type("text").send("OK - ToyyibPay sandbox server is running");
 });
 
-// === RETURN (papar resit + auto-redirect deep link ke app) ===
+// === RETURN (papar resit + auto-redirect deep link ke app, TUNGGU 10s) ===
 app.all("/toyyib/return", async (req, res) => {
   const p = Object.keys(req.query).length ? req.query : req.body;
   const status_id = (p.status_id || "").toString();
@@ -119,7 +119,6 @@ app.all("/toyyib/return", async (req, res) => {
         if (typeof rows[0].amount_cents === "number") {
           amount = (rows[0].amount_cents / 100).toFixed(2);
         }
-        // NEW: kalau return bawa billcode & DB belum ada → simpan sekali
         if (billcode && !rows[0].billcode) {
           await pool.query(
             "UPDATE orders SET billcode=$1, updated_at=NOW() WHERE order_id=$2",
@@ -131,7 +130,6 @@ app.all("/toyyib/return", async (req, res) => {
   } catch (e) {
     console.error("DB lookup/update on return failed:", e);
   }
-  // fallback terakhir: cuba baca dari param (kadang-kadang ToyyibPay tak hantar)
   if (!amount && p.amount && /^\d+(\.\d{1,2})?$/.test(p.amount)) {
     amount = p.amount;
   }
@@ -153,20 +151,13 @@ app.all("/toyyib/return", async (req, res) => {
     (txid     ? `&transaction_id=${encodeURIComponent(txid)}` : "") +
     `#Intent;scheme=mizrahbeauty;package=com.tutorialworldskill.mizrahbeauty;end`;
 
+  // Papar 10s sebelum redirect
   res.type("html").send(`<!doctype html>
 <html lang="ms"><meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Resit / Return</title>
-<meta http-equiv="refresh" content="0;url=${appLink}">
-<script>
-  window.addEventListener('load', function(){
-    try { window.location.replace(${JSON.stringify(appLink)}); } catch(e){}
-    setTimeout(function(){
-      var ua = navigator.userAgent || '';
-      if (/Android/i.test(ua)) { window.location.href = ${JSON.stringify(androidIntent)}; }
-    }, 800);
-  });
-</script>
+<!-- Fallback meta refresh selepas 10s -->
+<meta http-equiv="refresh" content="10;url=${appLink}">
 <style>
  body{font-family:system-ui,Arial,sans-serif;max-width:720px;margin:24px auto;padding:16px}
  .card{border:1px solid #eee;border-radius:14px;padding:18px;box-shadow:0 2px 10px rgba(0,0,0,.05)}
@@ -174,15 +165,69 @@ app.all("/toyyib/return", async (req, res) => {
  .key{width:160px;color:#666}
  .val{font-weight:600}
  .btn{display:inline-block;margin-top:16px;padding:10px 14px;border-radius:10px;border:1px solid #ddd;text-decoration:none}
+ .muted{color:#666}
+ .count{font-weight:700}
+ .bar{height:10px;background:#eee;border-radius:999px;overflow:hidden;margin-top:8px}
+ .bar>span{display:block;height:100%;width:0%;background:#16a34a;transition:width .2s linear}
 </style>
 <h2>Maklumbalas Pembayaran</h2>
+<p class="muted">Laman ini akan kembali ke aplikasi dalam <span class="count" id="count">10</span> saat…</p>
+<div class="bar"><span id="prog"></span></div>
 <div class="card">
   <div class="row"><div class="key">Status</div><div class="val">${status_id==="1"?"BERJAYA":status_id==="3"?"GAGAL":"PENDING"}</div></div>
   <div class="row"><div class="key">Order ID</div><div class="val">${order_id||"—"}</div></div>
   <div class="row"><div class="key">Billcode</div><div class="val">${billcode||"—"}</div></div>
   <div class="row"><div class="key">Amount</div><div class="val">${amount?("RM "+amount):"—"}</div></div>
+  ${txid?`<div class="row"><div class="key">Transaksi</div><div class="val">${txid}</div></div>`:""}
 </div>
-<a class="btn" href="${appLink}">Kembali ke aplikasi</a>
+<a class="btn" id="openNow" href="${appLink}">Buka aplikasi sekarang</a>
+
+<script>
+(function(){
+  var wait = 10;
+  var countEl = document.getElementById('count');
+  var progEl  = document.getElementById('prog');
+  var appLink = ${JSON.stringify(appLink)};
+  var androidIntent = ${JSON.stringify(androidIntent)};
+  var total = wait, elapsed = 0;
+
+  function tick(){
+    elapsed++;
+    var left = total - elapsed;
+    if (left < 0) left = 0;
+    countEl.textContent = String(left);
+    progEl.style.width = ((elapsed/total)*100) + '%';
+    if (elapsed >= total) {
+      redirect();
+      clearInterval(tmr);
+    }
+  }
+
+  function redirect(){
+    try { window.location.replace(appLink); } catch(e){}
+    // Android intent fallback selepas 800ms
+    setTimeout(function(){
+      var ua = navigator.userAgent || '';
+      if (/Android/i.test(ua)) { window.location.href = androidIntent; }
+    }, 800);
+  }
+
+  // update setiap 1s
+  var tmr = setInterval(tick, 1000);
+  // initial paint
+  countEl.textContent = String(wait);
+  progEl.style.width = '0%';
+
+  // butang manual
+  document.getElementById('openNow').addEventListener('click', function(e){
+    // benarkan default <a> navigate; juga cuba intent utk Android
+    setTimeout(function(){
+      var ua = navigator.userAgent || '';
+      if (/Android/i.test(ua)) { window.location.href = androidIntent; }
+    }, 100);
+  });
+})();
+</script>
 </html>`);
 });
 
