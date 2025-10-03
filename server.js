@@ -1,5 +1,6 @@
 import express from "express";
 import bodyParser from "body-parser";
+import cors from "cors";
 import { Pool } from "pg";
 
 const app = express();
@@ -28,8 +29,8 @@ async function ensureSchema() {
       billcode      VARCHAR(64),
       amount_cents  INTEGER NOT NULL DEFAULT 0,
       currency      VARCHAR(3) NOT NULL DEFAULT 'MYR',
-      status_id     SMALLINT NOT NULL DEFAULT 0,   -- 1=PAID,2=PENDING,3=FAILED
-      status_text   VARCHAR(32) NOT NULL DEFAULT 'UNKNOWN',
+      status_id     SMALLINT NOT NULL DEFAULT 0,   -- 0=REGISTERED,1=PAID,2=PENDING,3=FAILED
+      status_text   VARCHAR(32) NOT NULL DEFAULT 'REGISTERED',
       payer_email   VARCHAR(255),
       payer_phone   VARCHAR(64),
       payer_name    VARCHAR(255),
@@ -40,6 +41,7 @@ async function ensureSchema() {
       updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_orders_billcode ON orders(billcode);
+    CREATE INDEX IF NOT EXISTS idx_orders_status   ON orders(status_id);
   `);
 }
 ensureSchema().catch(e => {
@@ -59,31 +61,49 @@ const toCents = v => {
 const statusText = s => (s === "1" ? "PAID" : s === "3" ? "FAILED" : "PENDING");
 
 // Middleware
+app.use(cors());
 app.use(bodyParser.urlencoded({ extended: false })); // ToyyibPay hantar form-urlencoded
 app.use(bodyParser.json());
 
-// === Register Order (dipanggil sebelum redirect ke ToyyibPay) ===
+// Healthcheck
+app.get("/", (req, res) => {
+  res.type("text").send("OK - ToyyibPay sandbox server is running");
+});
+
+/* =========================================================
+   REGISTER ORDER (dipanggil sebelum redirect ke ToyyibPay)
+   ========================================================= */
 app.post("/order/register", async (req, res) => {
   try {
-    const { order_id, amount_cents, currency = "MYR", payer_name, payer_phone, payer_email } = req.body || {};
+    const {
+      order_id,
+      amount_cents,
+      currency = "MYR",
+      payer_name,
+      payer_phone,
+      payer_email,
+      billcode // optional – kalau anda sudah tahu selepas create-bill dari app
+    } = req.body || {};
 
     if (!order_id || !Number.isInteger(amount_cents)) {
       return res.status(400).json({ ok: false, error: "order_id / amount_cents invalid" });
     }
 
     await pool.query(`
-      INSERT INTO orders (order_id, amount_cents, currency, status_id, status_text, payer_email, payer_phone, payer_name, raw_payload)
-      VALUES ($1,$2,$3,0,'REGISTERED',$4,$5,$6,$7)
+      INSERT INTO orders (order_id, amount_cents, currency, status_id, status_text, payer_email, payer_phone, payer_name, billcode, raw_payload)
+      VALUES ($1,$2,$3,0,'REGISTERED',$4,$5,$6,$7,$8)
       ON CONFLICT (order_id) DO UPDATE SET
         amount_cents = EXCLUDED.amount_cents,
         currency     = EXCLUDED.currency,
         payer_email  = EXCLUDED.payer_email,
         payer_phone  = EXCLUDED.payer_phone,
         payer_name   = EXCLUDED.payer_name,
+        billcode     = COALESCE(EXCLUDED.billcode, orders.billcode),
         updated_at   = NOW()
     `, [
       order_id, amount_cents, currency,
       payer_email || null, payer_phone || null, payer_name || null,
+      billcode || null,
       JSON.stringify({ source: "app-pre-register" })
     ]);
 
@@ -94,18 +114,102 @@ app.post("/order/register", async (req, res) => {
   }
 });
 
-// Healthcheck
-app.get("/", (req, res) => {
-  res.type("text").send("OK - ToyyibPay sandbox server is running");
+/* =========================================================
+   (PILIHAN) ATTACH BILL – ikat billcode kepada order_id
+   ========================================================= */
+app.post("/order/attach-bill", async (req, res) => {
+  try {
+    const { order_id, billcode } = req.body || {};
+    if (!order_id || !billcode) {
+      return res.status(400).json({ ok: false, error: "order_id & billcode diperlukan" });
+    }
+    const { rowCount } = await pool.query(
+      "UPDATE orders SET billcode=$1, updated_at=NOW() WHERE order_id=$2",
+      [billcode, order_id]
+    );
+    res.json({ ok: true, updated: rowCount });
+  } catch (e) {
+    console.error("attach-bill failed", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
-// === RETURN (papar resit + auto-redirect deep link ke app, TUNGGU 10s) ===
+/* =========================================================
+   STATUS ENDPOINT – dipanggil oleh QrDisplayActivity (polling)
+   ========================================================= */
+app.get("/order/status", async (req, res) => {
+  try {
+    const order_id = (req.query.order_id || "").toString();
+    if (!order_id) return res.status(400).json({ ok: false, error: "order_id diperlukan" });
+
+    const { rows } = await pool.query(
+      "SELECT order_id, billcode, amount_cents, status_id, status_text, paid_at FROM orders WHERE order_id=$1 LIMIT 1",
+      [order_id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: "order tidak ditemui" });
+
+    const r = rows[0];
+    const isPaid = r.status_id === 1 || r.status_text === "PAID" || !!r.paid_at;
+
+    // Pulangkan bentuk yang Option-B anda akan faham
+    res.json({
+      ok: true,
+      order_id: r.order_id,
+      billcode: r.billcode || null,
+      amount_cents: r.amount_cents,
+      amount: (r.amount_cents / 100).toFixed(2),
+      status_id: String(r.status_id),           // "1" | "2" | "3"
+      status: isPaid ? "PAID" : r.status_text,  // "PAID" | "PENDING" | "FAILED" | ...
+      paid: isPaid,
+      paid_at: r.paid_at
+    });
+  } catch (e) {
+    console.error("status failed", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================================================
+   RETURN PAGE – papar resit + deeplink; juga sync status cepat
+   ========================================================= */
 app.all("/toyyib/return", async (req, res) => {
   const p = Object.keys(req.query).length ? req.query : req.body;
   const status_id = (p.status_id || "").toString();
   const billcode  = (p.billcode  || "").toString();
   const order_id  = (p.order_id  || "").toString();
   const txid      = (p.transaction_id || "").toString();
+
+  // Sync status ke DB (jika ada order_id / billcode)
+  try {
+    if (status_id || billcode) {
+      const fields = {
+        status_id: parseInt(status_id || "2", 10) || 2,
+        status_text: statusText(status_id || "2"),
+        billcode: billcode || null,
+        updated_at: new Date().toISOString()
+      };
+      if (status_id === "1") fields["paid_at"] = new Date().toISOString();
+
+      const setCols = Object.keys(fields).map((k, i) => `${k} = $${i + 1}`).join(", ");
+      const setVals = Object.values(fields);
+
+      let result = { rowCount: 0 };
+      if (order_id) {
+        result = await pool.query(
+          `UPDATE orders SET ${setCols} WHERE order_id = $${setVals.length + 1}`,
+          [...setVals, order_id]
+        );
+      }
+      if (result.rowCount === 0 && billcode) {
+        result = await pool.query(
+          `UPDATE orders SET ${setCols} WHERE billcode = $${setVals.length + 1}`,
+          [...setVals, billcode]
+        );
+      }
+    }
+  } catch (e) {
+    console.error("DB sync on return failed:", e);
+  }
 
   // NEW: ambil amount dari DB ikut order_id (fallback guna query param)
   let amount = "";
@@ -119,16 +223,10 @@ app.all("/toyyib/return", async (req, res) => {
         if (typeof rows[0].amount_cents === "number") {
           amount = (rows[0].amount_cents / 100).toFixed(2);
         }
-        if (billcode && !rows[0].billcode) {
-          await pool.query(
-            "UPDATE orders SET billcode=$1, updated_at=NOW() WHERE order_id=$2",
-            [billcode, order_id]
-          );
-        }
       }
     }
   } catch (e) {
-    console.error("DB lookup/update on return failed:", e);
+    console.error("DB lookup on return failed:", e);
   }
   if (!amount && p.amount && /^\d+(\.\d{1,2})?$/.test(p.amount)) {
     amount = p.amount;
@@ -156,7 +254,6 @@ app.all("/toyyib/return", async (req, res) => {
 <html lang="ms"><meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Resit / Return</title>
-<!-- Fallback meta refresh selepas 10s -->
 <meta http-equiv="refresh" content="10;url=${appLink}">
 <style>
  body{font-family:system-ui,Arial,sans-serif;max-width:720px;margin:24px auto;padding:16px}
@@ -205,22 +302,17 @@ app.all("/toyyib/return", async (req, res) => {
 
   function redirect(){
     try { window.location.replace(appLink); } catch(e){}
-    // Android intent fallback selepas 800ms
     setTimeout(function(){
       var ua = navigator.userAgent || '';
       if (/Android/i.test(ua)) { window.location.href = androidIntent; }
     }, 800);
   }
 
-  // update setiap 1s
   var tmr = setInterval(tick, 1000);
-  // initial paint
   countEl.textContent = String(wait);
   progEl.style.width = '0%';
 
-  // butang manual
   document.getElementById('openNow').addEventListener('click', function(e){
-    // benarkan default <a> navigate; juga cuba intent utk Android
     setTimeout(function(){
       var ua = navigator.userAgent || '';
       if (/Android/i.test(ua)) { window.location.href = androidIntent; }
@@ -231,16 +323,16 @@ app.all("/toyyib/return", async (req, res) => {
 </html>`);
 });
 
-// === CALLBACK dari ToyyibPay (server-to-server) ===
+/* =========================================================
+   CALLBACK dari ToyyibPay (server-to-server)
+   ========================================================= */
 app.post("/toyyib/callback/:token", async (req, res) => {
   try {
-    // 1) token security
     if (!CALLBACK_TOKEN || req.params.token !== CALLBACK_TOKEN) {
       console.warn("Invalid callback token");
       return res.status(403).type("text").send("Forbidden");
     }
 
-    // 2) ambil payload
     const p = Object.keys(req.body).length ? req.body : req.query;
     const billcode = (p.billcode || "").toString();
     const order_id = (p.order_id || "").toString();
@@ -248,7 +340,6 @@ app.post("/toyyib/callback/:token", async (req, res) => {
     const txid = (p.transaction_id || "").toString();
     const amtCents = p.amount ? toCents(p.amount) : null;
 
-    // 3) sediakan field untuk UPDATE
     const fields = {
       billcode: billcode || null,
       status_id: parseInt(sId || "0", 10) || 0,
@@ -259,11 +350,9 @@ app.post("/toyyib/callback/:token", async (req, res) => {
     if (amtCents !== null) fields.amount_cents = amtCents;
     if (sId === "1") fields.paid_at = new Date().toISOString();
 
-    // Build SET dinamik
     const setCols = Object.keys(fields).map((k, i) => `${k} = $${i + 1}`).join(", ");
     const setVals = Object.values(fields);
 
-    // 4) Update by order_id → fallback billcode → kalau masih tiada, insert
     let result = { rowCount: 0 };
     if (order_id) {
       result = await pool.query(
