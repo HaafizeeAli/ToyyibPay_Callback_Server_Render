@@ -170,7 +170,7 @@ app.get("/order/status", async (req, res) => {
 });
 
 /* =========================================================
-   RETURN PAGE – papar resit + deeplink; juga sync status cepat
+   RETURN PAGE – versi auto-redirect ke app (Android intent)
    ========================================================= */
 app.all("/toyyib/return", async (req, res) => {
   const p = Object.keys(req.query).length ? req.query : req.body;
@@ -179,7 +179,7 @@ app.all("/toyyib/return", async (req, res) => {
   const order_id  = (p.order_id  || "").toString();
   const txid      = (p.transaction_id || "").toString();
 
-  // Sync status ke DB (jika ada order_id / billcode)
+  // Sync status ke DB
   try {
     if (status_id || billcode) {
       const fields = {
@@ -211,115 +211,77 @@ app.all("/toyyib/return", async (req, res) => {
     console.error("DB sync on return failed:", e);
   }
 
-  // NEW: ambil amount dari DB ikut order_id (fallback guna query param)
+  // Ambil amount dari DB
   let amount = "";
   try {
     if (order_id) {
       const { rows } = await pool.query(
-        "SELECT amount_cents, billcode FROM orders WHERE order_id=$1 LIMIT 1",
+        "SELECT amount_cents FROM orders WHERE order_id=$1 LIMIT 1",
         [order_id]
       );
-      if (rows.length) {
-        if (typeof rows[0].amount_cents === "number") {
-          amount = (rows[0].amount_cents / 100).toFixed(2);
-        }
-      }
+      if (rows.length) amount = (rows[0].amount_cents / 100).toFixed(2);
     }
   } catch (e) {
     console.error("DB lookup on return failed:", e);
   }
-  if (!amount && p.amount && /^\d+(\.\d{1,2})?$/.test(p.amount)) {
-    amount = p.amount;
-  }
+  if (!amount && p.amount) amount = p.amount;
 
-  const appLink =
-    `mizrahbeauty://payment-result` +
-    `?status_id=${encodeURIComponent(status_id)}` +
-    `&order_id=${encodeURIComponent(order_id)}` +
-    (billcode ? `&billcode=${encodeURIComponent(billcode)}` : "") +
-    (amount   ? `&amount=${encodeURIComponent(amount)}` : "") +
-    (txid     ? `&transaction_id=${encodeURIComponent(txid)}` : "");
+  // === Construct Deep Link ===
+  const scheme = "mizrahbeauty";
+  const pkg = "com.tutorialworldskill.mizrahbeauty";
+  const deeplink = `${scheme}://payment-result?status_id=${encodeURIComponent(status_id)}&order_id=${encodeURIComponent(order_id)}&billcode=${encodeURIComponent(billcode)}&amount=${encodeURIComponent(amount)}&transaction_id=${encodeURIComponent(txid)}`;
+  const intentUri = `intent://payment-result?status_id=${encodeURIComponent(status_id)}&order_id=${encodeURIComponent(order_id)}&billcode=${encodeURIComponent(billcode)}&amount=${encodeURIComponent(amount)}&transaction_id=${encodeURIComponent(txid)}#Intent;scheme=${scheme};package=${pkg};S.browser_fallback_url=https%3A%2F%2Fplay.google.com%2Fstore%2Fapps%2Fdetails%3Fid%3D${pkg};end`;
 
-  const androidIntent =
-    `intent://payment-result` +
-    `?status_id=${encodeURIComponent(status_id)}` +
-    `&order_id=${encodeURIComponent(order_id)}` +
-    (billcode ? `&billcode=${encodeURIComponent(billcode)}` : "") +
-    (amount   ? `&amount=${encodeURIComponent(amount)}`   : "") +
-    (txid     ? `&transaction_id=${encodeURIComponent(txid)}` : "") +
-    `#Intent;scheme=mizrahbeauty;package=com.tutorialworldskill.mizrahbeauty;end`;
-
-  // Papar 10s sebelum redirect
+  // === Render auto redirect page ===
   res.type("html").send(`<!doctype html>
-<html lang="ms"><meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Resit / Return</title>
-<meta http-equiv="refresh" content="10;url=${appLink}">
-<style>
- body{font-family:system-ui,Arial,sans-serif;max-width:720px;margin:24px auto;padding:16px}
- .card{border:1px solid #eee;border-radius:14px;padding:18px;box-shadow:0 2px 10px rgba(0,0,0,.05)}
- .row{display:flex;gap:8px;align-items:center;margin:8px 0}
- .key{width:160px;color:#666}
- .val{font-weight:600}
- .btn{display:inline-block;margin-top:16px;padding:10px 14px;border-radius:10px;border:1px solid #ddd;text-decoration:none}
- .muted{color:#666}
- .count{font-weight:700}
- .bar{height:10px;background:#eee;border-radius:999px;overflow:hidden;margin-top:8px}
- .bar>span{display:block;height:100%;width:0%;background:#16a34a;transition:width .2s linear}
-</style>
-<h2>Maklumbalas Pembayaran</h2>
-<p class="muted">Laman ini akan kembali ke aplikasi dalam <span class="count" id="count">10</span> saat…</p>
-<div class="bar"><span id="prog"></span></div>
-<div class="card">
-  <div class="row"><div class="key">Status</div><div class="val">${status_id==="1"?"BERJAYA":status_id==="3"?"GAGAL":"PENDING"}</div></div>
-  <div class="row"><div class="key">Order ID</div><div class="val">${order_id||"—"}</div></div>
-  <div class="row"><div class="key">Billcode</div><div class="val">${billcode||"—"}</div></div>
-  <div class="row"><div class="key">Amount</div><div class="val">${amount?("RM "+amount):"—"}</div></div>
-  ${txid?`<div class="row"><div class="key">Transaksi</div><div class="val">${txid}</div></div>`:""}
-</div>
-<a class="btn" id="openNow" href="${appLink}">Buka aplikasi sekarang</a>
+<html lang="ms">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Maklumbalas Pembayaran</title>
+  <style>
+    body{font-family:system-ui,Arial,sans-serif;max-width:700px;margin:24px auto;padding:16px;text-align:center}
+    .card{border:1px solid #ddd;border-radius:14px;padding:20px;margin-top:10px;box-shadow:0 3px 10px rgba(0,0,0,0.05)}
+    .ok{color:#15803d;font-weight:700}
+    .fail{color:#dc2626;font-weight:700}
+    .bar{height:8px;background:#eee;border-radius:10px;overflow:hidden;margin-top:10px}
+    .bar>span{display:block;height:100%;width:0%;background:#16a34a;transition:width .2s linear}
+    .btn{display:inline-block;margin-top:20px;padding:10px 14px;border-radius:8px;border:1px solid #2563eb;color:#2563eb;text-decoration:none}
+  </style>
+</head>
+<body>
+  <h2>Maklumbalas Pembayaran</h2>
+  <p>Laman ini akan kembali ke aplikasi dalam <span id="count">5</span> saat...</p>
+  <div class="bar"><span id="prog"></span></div>
+  <div class="card">
+    <p>Status: <span class="${status_id==="1"?"ok":"fail"}">${status_id==="1"?"BERJAYA":status_id==="3"?"GAGAL":"PENDING"}</span></p>
+    <p>Order ID: ${order_id || "—"}</p>
+    <p>Billcode: ${billcode || "—"}</p>
+    <p>Amount: RM ${amount || "—"}</p>
+    ${txid?`<p>Transaksi: ${txid}</p>`:""}
+  </div>
+  <a class="btn" href="${deeplink}" id="btn">Buka aplikasi sekarang</a>
 
-<script>
-(function(){
-  var wait = 10;
-  var countEl = document.getElementById('count');
-  var progEl  = document.getElementById('prog');
-  var appLink = ${JSON.stringify(appLink)};
-  var androidIntent = ${JSON.stringify(androidIntent)};
-  var total = wait, elapsed = 0;
-
-  function tick(){
-    elapsed++;
-    var left = total - elapsed;
-    if (left < 0) left = 0;
-    countEl.textContent = String(left);
-    progEl.style.width = ((elapsed/total)*100) + '%';
-    if (elapsed >= total) {
-      redirect();
-      clearInterval(tmr);
-    }
+  <script>
+  const deeplink=${JSON.stringify(deeplink)};
+  const intentUri=${JSON.stringify(intentUri)};
+  let sec=5, total=5;
+  const c=document.getElementById('count'), p=document.getElementById('prog');
+  const t=setInterval(()=>{
+    sec--; if(sec<0){clearInterval(t); go();}
+    c.textContent=sec; p.style.width=((total-sec)/total*100)+'%';
+  },1000);
+  function go(){
+    // try intent:// for Chrome
+    window.location.replace(intentUri);
+    // fallback to mizrahbeauty://
+    setTimeout(()=>window.location.href=deeplink,1200);
   }
-
-  function redirect(){
-    try { window.location.replace(appLink); } catch(e){}
-    setTimeout(function(){
-      var ua = navigator.userAgent || '';
-      if (/Android/i.test(ua)) { window.location.href = androidIntent; }
-    }, 800);
-  }
-
-  var tmr = setInterval(tick, 1000);
-  countEl.textContent = String(wait);
-  progEl.style.width = '0%';
-
-  document.getElementById('openNow').addEventListener('click', function(e){
-    setTimeout(function(){
-      var ua = navigator.userAgent || '';
-      if (/Android/i.test(ua)) { window.location.href = androidIntent; }
-    }, 100);
+  document.getElementById('btn').addEventListener('click',e=>{
+    e.preventDefault(); go();
   });
-})();
-</script>
+  </script>
+</body>
 </html>`);
 });
 
